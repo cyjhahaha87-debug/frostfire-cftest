@@ -65,7 +65,14 @@ function createPlayer(ws, name) {
     hp: MAX_HP,
     alive: true,
     lastInput: 0,
-    respawnAt: 0
+    respawnAt: 0,
+    // Melee state (server-side)
+    stagger: 0,          // ms remaining
+    meleeHitCount: 0,
+    lastMeleeHitAt: 0,
+    knockedDown: false,
+    knockdownUntil: 0,
+    invulUntil: 0
   };
   players.set(id, player);
   return player;
@@ -134,6 +141,64 @@ wss.on('connection', (ws) => {
         player.z = Math.max(-150, Math.min(150, msg.z));
         player.rotY = msg.rotY || 0;
         player.lastInput = Date.now();
+      }
+    }
+    else if (msg.type === 'melee') {
+      if (!player.alive) return;
+      if (!msg.hitId || !players.has(msg.hitId)) return;
+      const victim = players.get(msg.hitId);
+      if (!victim.alive) return;
+      // Check invul
+      const now = Date.now();
+      if (victim.invulUntil > now) return;
+      // Distance check (melee range + a bit for lag)
+      const dx = victim.x - player.x;
+      const dz = victim.z - player.z;
+      const dist = Math.sqrt(dx*dx + dz*dz);
+      if (dist > 8) return; // too far to be a valid melee
+
+      const MELEE_DAMAGE = 15;
+      victim.hp -= MELEE_DAMAGE;
+
+      // Stagger
+      victim.stagger = 1000; // 1 second
+      // Count consecutive hits
+      if (now - victim.lastMeleeHitAt > 5000) {
+        victim.meleeHitCount = 0;
+      }
+      victim.meleeHitCount += 1;
+      victim.lastMeleeHitAt = now;
+
+      broadcast({
+        type: 'melee_hit',
+        attackerId: player.id,
+        victimId: victim.id,
+        hp: victim.hp,
+        hitCount: victim.meleeHitCount
+      });
+
+      // 4th hit -> knockdown
+      if (victim.meleeHitCount >= 4 && victim.hp > 0) {
+        victim.knockedDown = true;
+        victim.knockdownUntil = now + 2000; // 2s down
+        victim.invulUntil = now + 2300;     // invul covers knockdown + small margin
+        victim.meleeHitCount = 0;
+        broadcast({
+          type: 'knockdown',
+          victimId: victim.id,
+          attackerId: player.id
+        });
+      }
+
+      if (victim.hp <= 0) {
+        victim.alive = false;
+        victim.hp = 0;
+        victim.respawnAt = now + RESPAWN_DELAY;
+        broadcast({
+          type: 'death',
+          victimId: victim.id,
+          killerId: player.id
+        });
       }
     }
     else if (msg.type === 'shoot') {
@@ -213,12 +278,21 @@ setInterval(() => {
       p.z = spawn.z;
       p.hp = MAX_HP;
       p.alive = true;
+      p.stagger = 0;
+      p.meleeHitCount = 0;
+      p.knockedDown = false;
+      p.invulUntil = 0;
       broadcast({
         type: 'respawn',
         id: p.id,
         x: p.x, y: p.y, z: p.z,
         hp: p.hp
       });
+    }
+    // Knockdown expiry
+    if (p.knockedDown && now >= p.knockdownUntil) {
+      p.knockedDown = false;
+      broadcast({ type: 'getup', id: p.id });
     }
   }
 
