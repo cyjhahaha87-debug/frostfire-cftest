@@ -107,7 +107,7 @@
   Space — 점프 / 공중 부스트<br>
   좌클릭 — 사격 / 우클릭 — 자석 락온<br>
   Tab — 락온 전환<br>
-  <b>1</b> — 기관총 / <b>2</b> — 빔포<br>
+  <b>1</b> 빔샤벨 / <b>2</b> 기관총 / <b>3</b> 빔포<br>
 </div>
 
 <div id="hud-right" class="hidden">
@@ -127,14 +127,19 @@
   </div>
   <div id="weapons-ui" style="display:flex; gap:6px; margin-top:4px;">
     <div class="weapon-slot" id="weapon-1">
-      <div class="w-header"><span class="w-key">[1]</span> 기관총</div>
-      <div class="w-ammo" id="w1-ammo">30 / 30</div>
+      <div class="w-header"><span class="w-key">[1]</span> 빔샤벨</div>
+      <div class="w-ammo" id="w1-ammo">∞</div>
       <div class="w-status" id="w1-status"></div>
     </div>
     <div class="weapon-slot" id="weapon-2">
-      <div class="w-header"><span class="w-key">[2]</span> 빔포</div>
-      <div class="w-ammo" id="w2-ammo">3 / 3</div>
+      <div class="w-header"><span class="w-key">[2]</span> 기관총</div>
+      <div class="w-ammo" id="w2-ammo">30 / 30</div>
       <div class="w-status" id="w2-status"></div>
+    </div>
+    <div class="weapon-slot" id="weapon-3">
+      <div class="w-header"><span class="w-key">[3]</span> 빔포</div>
+      <div class="w-ammo" id="w3-ammo">3 / 3</div>
+      <div class="w-status" id="w3-status"></div>
     </div>
   </div>
 </div>
@@ -292,7 +297,28 @@ function createRobot(colorPrimary, colorSecondary, accentColor) {
   flame.visible = false;
   robot.add(flame);
 
-  return { group: robot, arms, legs, flame, visor };
+  // Beam saber (attached to right arm, hidden by default)
+  const saberGroup = new THREE.Group();
+  const saberCore = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.08, 0.08, 1.8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  saberCore.position.y = 0.9;
+  saberGroup.add(saberCore);
+  const saberGlow = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.22, 0.22, 1.8, 8),
+    new THREE.MeshBasicMaterial({
+      color: accentColor, transparent: true, opacity: 0.6,
+      blending: THREE.AdditiveBlending, depthWrite: false
+    })
+  );
+  saberGlow.position.y = 0.9;
+  saberGroup.add(saberGlow);
+  saberGroup.position.set(1.0, 0.5, 0);
+  saberGroup.visible = false;
+  robot.add(saberGroup);
+
+  return { group: robot, arms, legs, flame, visor, saberGroup, saberGlow, saberCore };
 }
 
 // ===== Health bar (billboarded sprite) =====
@@ -340,65 +366,87 @@ const playerState = {
   hitFlash: 0,
   alive: true,
   // Weapon system
-  currentWeapon: 1, // 1 = machine gun, 2 = beam cannon
+  currentWeapon: 2, // Default to machine gun (most used)
   weapons: {
-    1: { // Machine gun
+    1: { // Beam saber (melee)
+      cooldown: 0.6, // between swings
+      range: 6,      // must be within this to use
+      damage: 15,
+      dashSpeed: 28,
+      dashTime: 0.25
+    },
+    2: { // Machine gun
       ammo: 30, maxAmmo: 30,
       reloading: false,
       reloadTime: 10.0,
       reloadRemaining: 0,
-      cooldown: 0.12, // between shots
+      cooldown: 0.12,
       range: 50,
       damage: 8
     },
-    2: { // Beam cannon
+    3: { // Beam cannon - stack based
       ammo: 3, maxAmmo: 3,
-      reloading: false, // fully reloaded (auto recharge per shot)
-      reloadTime: 20.0,
-      reloadRemaining: 0,
-      cooldown: 1.0, // post-fire recovery
+      reloading: false,
+      chargeTime: 10.0,   // per-shot charge time
+      chargeRemaining: 0, // time until next +1
+      cooldown: 1.0,      // post-fire delay
       range: 100,
       damage: 40
     }
   },
-  postFireDelay: 0 // locks actions (beam cannon backswing)
+  postFireDelay: 0,
+  // Melee state (self)
+  dashing: false,
+  dashTime: 0,
+  dashDir: new THREE.Vector3(),
+  dashTarget: null,
+  hasHit: false, // track if current dash already hit
+  swingTime: 0, // for visual arm swing
+  // Stagger (when hit by melee)
+  stagger: 0,       // time remaining in hit stun
+  meleeHitCount: 0, // accumulates, reset after 5s without hit
+  lastMeleeHitAt: 0,
+  knockedDown: false,
+  knockdownTime: 0,
+  invul: 0          // invulnerable timer
 };
 
 // ===== Weapon system =====
 function switchWeapon(n) {
-  if (playerState.postFireDelay > 0) return; // can't switch during beam cannon recovery
+  if (playerState.postFireDelay > 0) return;
+  if (playerState.dashing) return;
+  if (playerState.stagger > 0 || playerState.knockedDown) return;
   if (playerState.currentWeapon === n) return;
   playerState.currentWeapon = n;
-  playerState.fireCooldown = 0.15; // small cooldown after switch
+  playerState.fireCooldown = 0.15;
 }
 
 function updateWeapons(dt) {
-  for (const key of [1, 2]) {
-    const w = playerState.weapons[key];
-    if (w.reloading) {
-      w.reloadRemaining -= dt;
-      if (w.reloadRemaining <= 0) {
-        w.ammo = w.maxAmmo;
-        w.reloading = false;
-      }
+  // Weapon 2: machine gun reload
+  const w2 = playerState.weapons[2];
+  if (w2.reloading) {
+    w2.reloadRemaining -= dt;
+    if (w2.reloadRemaining <= 0) {
+      w2.ammo = w2.maxAmmo;
+      w2.reloading = false;
     }
-    // Weapon 2 (beam cannon): auto-recharge 1 shot at a time
-    if (key === 2 && !w.reloading && w.ammo < w.maxAmmo) {
-      if (!w._recharging) {
-        w._recharging = true;
-        w.reloadRemaining = w.reloadTime;
-      }
-      w.reloadRemaining -= dt;
-      if (w.reloadRemaining <= 0) {
-        w.ammo = Math.min(w.ammo + 1, w.maxAmmo);
-        if (w.ammo < w.maxAmmo) {
-          w.reloadRemaining = w.reloadTime;
-        } else {
-          w._recharging = false;
-        }
+  }
+
+  // Weapon 3: beam cannon stack-based recharge
+  // Charges one shot at a time, always running unless full
+  const w3 = playerState.weapons[3];
+  if (w3.ammo < w3.maxAmmo) {
+    w3.chargeRemaining -= dt;
+    if (w3.chargeRemaining <= 0) {
+      w3.ammo += 1;
+      if (w3.ammo < w3.maxAmmo) {
+        w3.chargeRemaining = w3.chargeTime;
+      } else {
+        w3.chargeRemaining = 0;
       }
     }
   }
+
   if (playerState.postFireDelay > 0) {
     playerState.postFireDelay -= dt;
   }
@@ -412,6 +460,7 @@ addEventListener('keydown', e => {
   if (e.code === 'Tab') { e.preventDefault(); cycleLockOn(); }
   if (e.code === 'Digit1' || e.code === 'Numpad1') switchWeapon(1);
   if (e.code === 'Digit2' || e.code === 'Numpad2') switchWeapon(2);
+  if (e.code === 'Digit3' || e.code === 'Numpad3') switchWeapon(3);
 });
 addEventListener('keyup', e => keys[e.code] = false);
 addEventListener('mousedown', e => {
@@ -635,27 +684,38 @@ function updateHUD() {
   damageFlash.style.opacity = playerState.hitFlash;
 
   // Weapons
-  for (const n of [1, 2]) {
+  for (const n of [1, 2, 3]) {
     const w = playerState.weapons[n];
     const slot = document.getElementById('weapon-' + n);
     const ammoEl = document.getElementById('w' + n + '-ammo');
     const statusEl = document.getElementById('w' + n + '-status');
     slot.classList.toggle('active', playerState.currentWeapon === n);
 
-    ammoEl.textContent = `${w.ammo} / ${w.maxAmmo}`;
-
     let status = '';
     if (n === 1) {
+      // Saber: show range status
+      ammoEl.textContent = '∞';
+      slot.classList.remove('reloading');
+      if (playerState.currentWeapon === 1) {
+        const lk = getLockTarget();
+        if (!lk) status = '락온 필요';
+        else {
+          const dx = lk.group.position.x - myGroup.position.x;
+          const dz = lk.group.position.z - myGroup.position.z;
+          const dist = Math.sqrt(dx*dx + dz*dz);
+          if (dist > w.range) status = `거리 초과 (${dist.toFixed(1)})`;
+          else status = `대쉬 가능 (${dist.toFixed(1)})`;
+        }
+      }
+    } else if (n === 2) {
+      ammoEl.textContent = `${w.ammo} / ${w.maxAmmo}`;
       slot.classList.toggle('reloading', w.reloading);
-      if (w.reloading) {
-        status = `재장전 ${w.reloadRemaining.toFixed(1)}s`;
-      }
-    } else {
+      if (w.reloading) status = `재장전 ${w.reloadRemaining.toFixed(1)}s`;
+    } else if (n === 3) {
+      ammoEl.textContent = `${w.ammo} / ${w.maxAmmo}`;
       slot.classList.toggle('reloading', w.ammo === 0);
-      if (w.ammo < w.maxAmmo && w._recharging) {
-        status = `충전 ${w.reloadRemaining.toFixed(1)}s`;
-      }
-      if (playerState.currentWeapon === 2 && playerState.postFireDelay > 0) {
+      if (w.ammo < w.maxAmmo) status = `+1 충전 ${w.chargeRemaining.toFixed(1)}s`;
+      if (playerState.currentWeapon === 3 && playerState.postFireDelay > 0) {
         status = `후딜 ${playerState.postFireDelay.toFixed(1)}s`;
       }
     }
@@ -741,7 +801,8 @@ function addRemotePlayer(pData) {
     prevX: pData.x, prevY: pData.y, prevZ: pData.z,
     hp: pData.hp,
     alive: pData.alive,
-    walkCycle: 0
+    walkCycle: 0,
+    knockedDown: false
   });
 }
 
@@ -827,7 +888,61 @@ function handleMessage(msg) {
       }
     }
   }
+  else if (msg.type === 'melee_hit') {
+    // Visual effect at victim
+    if (msg.victimId === myId) {
+      playerState.hp = msg.hp;
+      playerState.hitFlash = 1;
+      playerState.stagger = 1.0; // local stagger
+      playerState.meleeHitCount = msg.hitCount;
+      playerState.lastMeleeHitAt = performance.now();
+    } else {
+      const rp = remotePlayers.get(msg.victimId);
+      if (rp) {
+        rp.hp = msg.hp;
+        updateHealthBar(rp.hpBar, rp.hp, 100);
+        createExplosion(rp.group.position.clone().setY(1.2), 0xffffff);
+      }
+    }
+  }
+  else if (msg.type === 'knockdown') {
+    if (msg.victimId === myId) {
+      playerState.knockedDown = true;
+      playerState.knockdownTime = 2.0;
+      playerState.invul = 2.3;
+      playerState.stagger = 0;
+      playerState.meleeHitCount = 0;
+      // Stop movement
+      playerState.velocity.set(0, 0, 0);
+    } else {
+      const rp = remotePlayers.get(msg.victimId);
+      if (rp) {
+        rp.knockedDown = true;
+      }
+    }
+  }
+  else if (msg.type === 'getup') {
+    if (msg.id === myId) {
+      playerState.knockedDown = false;
+    } else {
+      const rp = remotePlayers.get(msg.id);
+      if (rp) rp.knockedDown = false;
+    }
+  }
   else if (msg.type === 'death') {
+    const victim = msg.victimId === myId ? { name: getMyName() } : remotePlayers.get(msg.victimId);
+    const killer = msg.killerId === myId ? { name: getMyName() } : remotePlayers.get(msg.killerId);
+    if (victim && killer) {
+      addKillMsg(`${killer.name} ▶ ${victim.name}`);
+    }
+    if (msg.victimId === myId) {
+      playerState.alive = false;
+      playerState.hp = 0;
+    } else {
+      const rp = remotePlayers.get(msg.victimId);
+      if (rp) { rp.alive = false; rp.group.visible = false; }
+    }
+  }
     const victim = msg.victimId === myId ? { name: getMyName() } : remotePlayers.get(msg.victimId);
     const killer = msg.killerId === myId ? { name: getMyName() } : remotePlayers.get(msg.killerId);
     if (victim && killer) {
@@ -844,19 +959,24 @@ function handleMessage(msg) {
   else if (msg.type === 'respawn') {
     if (msg.id === myId) {
       myGroup.position.set(msg.x, msg.y, msg.z);
+      myGroup.rotation.z = 0;
       playerState.hp = msg.hp;
       playerState.boost = playerState.maxBoost;
       playerState.alive = true;
       playerState.velocity.set(0, 0, 0);
       // Reset weapons
-      playerState.weapons[1].ammo = playerState.weapons[1].maxAmmo;
-      playerState.weapons[1].reloading = false;
-      playerState.weapons[1].reloadRemaining = 0;
       playerState.weapons[2].ammo = playerState.weapons[2].maxAmmo;
-      playerState.weapons[2]._recharging = false;
+      playerState.weapons[2].reloading = false;
       playerState.weapons[2].reloadRemaining = 0;
+      playerState.weapons[3].ammo = playerState.weapons[3].maxAmmo;
+      playerState.weapons[3].chargeRemaining = 0;
       playerState.postFireDelay = 0;
-      playerState.currentWeapon = 1;
+      playerState.currentWeapon = 2;
+      playerState.stagger = 0;
+      playerState.knockedDown = false;
+      playerState.meleeHitCount = 0;
+      playerState.invul = 0;
+      playerState.dashing = false;
     } else {
       const rp = remotePlayers.get(msg.id);
       if (rp) {
@@ -913,11 +1033,15 @@ function updatePlayer(dt) {
   const moving = moveDir.lengthSq() > 0;
   if (moving) moveDir.normalize();
 
-  const boosting = (keys['ShiftLeft'] || keys['ShiftRight']) && !playerState.overheat && playerState.boost > 0 && moving && playerState.postFireDelay <= 0;
-  const speed = boosting ? 18 : 7;
+  // Movement is locked during stagger, knockdown, or post-fire delay
+  const movementLocked = playerState.stagger > 0 || playerState.knockedDown || playerState.postFireDelay > 0;
+  const boosting = (keys['ShiftLeft'] || keys['ShiftRight']) && !playerState.overheat && playerState.boost > 0 && moving && !movementLocked && !playerState.dashing;
+  const baseSpeed = playerState.stagger > 0 ? 2 : 7; // slowed while staggered
+  const speed = boosting ? 18 : baseSpeed;
 
-  // During post-fire delay (beam cannon recovery), freeze horizontal movement
-  if (playerState.postFireDelay > 0) {
+  if (playerState.dashing) {
+    // Dash overrides horizontal velocity (set in dash section above)
+  } else if (movementLocked) {
     playerState.velocity.x = 0;
     playerState.velocity.z = 0;
   } else {
@@ -927,7 +1051,7 @@ function updatePlayer(dt) {
 
   myRobotData.flame.visible = boosting;
 
-  if (keys['Space'] && playerState.postFireDelay <= 0) {
+  if (keys['Space'] && !movementLocked && !playerState.dashing) {
     if (playerState.onGround) {
       playerState.velocity.y = 9;
       playerState.onGround = false;
@@ -958,7 +1082,9 @@ function updatePlayer(dt) {
   // Rotation
   const lock = getLockTarget();
   let targetYaw;
-  if (lock) {
+  if (playerState.dashing && playerState.dashTarget) {
+    targetYaw = Math.atan2(playerState.dashDir.x, playerState.dashDir.z) + Math.PI;
+  } else if (lock) {
     const dx = lock.group.position.x - myGroup.position.x;
     const dz = lock.group.position.z - myGroup.position.z;
     targetYaw = Math.atan2(dx, dz) + Math.PI;
@@ -970,7 +1096,24 @@ function updatePlayer(dt) {
   let diff = targetYaw - myGroup.rotation.y;
   while (diff > Math.PI) diff -= Math.PI * 2;
   while (diff < -Math.PI) diff += Math.PI * 2;
-  myGroup.rotation.y += diff * Math.min(dt * 12, 1);
+  // Freeze rotation when knocked down
+  if (!playerState.knockedDown) {
+    myGroup.rotation.y += diff * Math.min(dt * (playerState.dashing ? 20 : 12), 1);
+  }
+
+  // Knockdown visual: tilt sideways
+  if (playerState.knockedDown) {
+    myGroup.rotation.z = Math.min(myGroup.rotation.z + dt * 3, Math.PI / 2.2);
+  } else {
+    myGroup.rotation.z += (0 - myGroup.rotation.z) * Math.min(dt * 8, 1);
+  }
+
+  // Invul flash: blink visor
+  if (playerState.invul > 0) {
+    myRobotData.visor.material.emissiveIntensity = 0.8 + Math.sin(performance.now() * 0.03) * 1.5;
+  } else {
+    myRobotData.visor.material.emissiveIntensity = 0.8;
+  }
 
   // Anim
   if (moving && playerState.onGround) {
@@ -984,102 +1127,189 @@ function updatePlayer(dt) {
     for (const p of [...myRobotData.legs, ...myRobotData.arms]) p.rotation.x *= 0.85;
   }
 
-  // Firing
+  // === Stagger/knockdown/invul timers ===
+  if (playerState.stagger > 0) playerState.stagger -= dt;
+  if (playerState.invul > 0) playerState.invul -= dt;
+  if (playerState.knockedDown) {
+    playerState.knockdownTime -= dt;
+    if (playerState.knockdownTime <= 0) {
+      playerState.knockedDown = false;
+      playerState.meleeHitCount = 0;
+      playerState.invul = 0.3; // brief invul on getup
+    }
+  }
+  // Reset melee hit counter if no hits in 5s
+  if (playerState.meleeHitCount > 0 && performance.now() - playerState.lastMeleeHitAt > 5000) {
+    playerState.meleeHitCount = 0;
+  }
+
+  // === Dash (melee attack movement) ===
+  if (playerState.dashing) {
+    playerState.dashTime -= dt;
+    playerState.velocity.x = playerState.dashDir.x * playerState.weapons[1].dashSpeed;
+    playerState.velocity.z = playerState.dashDir.z * playerState.weapons[1].dashSpeed;
+
+    // Check hit during dash
+    if (!playerState.hasHit && playerState.dashTarget && playerState.dashTarget.alive) {
+      const dx = playerState.dashTarget.group.position.x - myGroup.position.x;
+      const dz = playerState.dashTarget.group.position.z - myGroup.position.z;
+      const dist = Math.sqrt(dx*dx + dz*dz);
+      if (dist < 2.0) {
+        playerState.hasHit = true;
+        // Send melee hit to server
+        ws.send(JSON.stringify({
+          type: 'melee',
+          hitId: playerState.dashTarget.id
+        }));
+        // Local saber hit effect
+        createExplosion(playerState.dashTarget.group.position.clone().setY(1.2), 0xffffff);
+      }
+    }
+
+    if (playerState.dashTime <= 0) {
+      playerState.dashing = false;
+      myRobotData.saberGroup.visible = false;
+      playerState.swingTime = 0;
+    }
+  }
+
+  // Saber swing visual (quick arc)
+  if (playerState.dashing) {
+    playerState.swingTime += dt;
+    myRobotData.saberGroup.visible = true;
+    // Swing arm forward and saber from up to forward
+    const t = Math.min(playerState.swingTime / playerState.weapons[1].dashTime, 1);
+    const swingAngle = -Math.PI/2 + t * Math.PI; // -90deg -> +90deg
+    myRobotData.arms[1].rotation.x = swingAngle;
+    myRobotData.saberGroup.rotation.x = swingAngle * 0.7;
+  } else {
+    myRobotData.saberGroup.visible = false;
+  }
+
+  // === Firing ===
   playerState.fireCooldown -= dt;
   const currentW = playerState.weapons[playerState.currentWeapon];
-  const canFire = mouse.left
-    && playerState.fireCooldown <= 0
-    && playerState.postFireDelay <= 0
-    && playerState.alive
-    && currentW.ammo > 0
-    && !(playerState.currentWeapon === 1 && currentW.reloading);
 
-  if (canFire) {
-    playerState.fireCooldown = currentW.cooldown;
-    currentW.ammo -= 1;
+  // Input: can we even try to fire?
+  const actionLocked = playerState.postFireDelay > 0
+    || playerState.dashing
+    || playerState.stagger > 0
+    || playerState.knockedDown;
 
-    // Machine gun triggers reload when empty
-    if (playerState.currentWeapon === 1 && currentW.ammo <= 0) {
-      currentW.reloading = true;
-      currentW.reloadRemaining = currentW.reloadTime;
-    }
-    // Beam cannon: apply post-fire delay, reset recharge timer
-    if (playerState.currentWeapon === 2) {
-      playerState.postFireDelay = currentW.cooldown; // 1s lock
-      if (!currentW._recharging) {
-        currentW._recharging = true;
-        currentW.reloadRemaining = currentW.reloadTime;
-      }
-    }
-
-    const armOffset = new THREE.Vector3(0.7, 0, 0).applyAxisAngle(new THREE.Vector3(0,1,0), myGroup.rotation.y);
-    const origin = myGroup.position.clone().add(armOffset);
-    origin.y += 1.0;
-
-    const range = currentW.range;
-    let targetPoint;
-    let hitId = null;
-    const fireLock = getLockTarget();
-    if (fireLock) {
-      const lockPos = fireLock.group.position.clone();
-      lockPos.y += 1.0;
-      const distToLock = origin.distanceTo(lockPos);
-      if (distToLock <= range) {
-        targetPoint = lockPos;
-        hitId = fireLock.id;
-      } else {
-        // Out of range: shoot toward lock but don't claim hit
-        targetPoint = lockPos;
-      }
-    } else {
-      targetPoint = aimPoint.clone();
-      // Client-side hitscan along beam within weapon range
-      const shotDir = targetPoint.clone().sub(origin).normalize();
-      let closestHit = null;
-      let closestDist = Infinity;
-      for (const rp of remotePlayers.values()) {
-        if (!rp.alive) continue;
-        const target = rp.group.position.clone();
-        target.y += 1.0;
-        const toTarget = target.clone().sub(origin);
-        const projLen = toTarget.dot(shotDir);
-        if (projLen < 0 || projLen > range) continue;
-        const projPoint = origin.clone().add(shotDir.clone().multiplyScalar(projLen));
-        const perpDist = projPoint.distanceTo(target);
-        // Beam cannon has tighter hit radius (more skill-based)
-        const hitRadius = playerState.currentWeapon === 2 ? 1.2 : 1.5;
-        if (perpDist < hitRadius && projLen < closestDist) {
-          closestDist = projLen;
-          closestHit = rp;
+  if (mouse.left && playerState.fireCooldown <= 0 && playerState.alive && !actionLocked) {
+    if (playerState.currentWeapon === 1) {
+      // === Beam saber: only works if locked target in range ===
+      const lock = getLockTarget();
+      if (lock) {
+        const dx = lock.group.position.x - myGroup.position.x;
+        const dz = lock.group.position.z - myGroup.position.z;
+        const dist = Math.sqrt(dx*dx + dz*dz);
+        if (dist <= currentW.range) {
+          // Initiate dash
+          playerState.dashing = true;
+          playerState.dashTime = currentW.dashTime;
+          playerState.hasHit = false;
+          playerState.dashTarget = lock;
+          const len = dist || 1;
+          playerState.dashDir.set(dx/len, 0, dz/len);
+          playerState.fireCooldown = currentW.cooldown;
+          playerState.swingTime = 0;
         }
       }
-      if (closestHit) {
-        hitId = closestHit.id;
-        targetPoint = closestHit.group.position.clone();
-        targetPoint.y += 1.0;
+      // No lock or out of range: nothing happens (could play "whiff" later)
+    }
+    else if (playerState.currentWeapon === 2) {
+      // === Machine gun ===
+      if (currentW.ammo > 0 && !currentW.reloading) {
+        playerState.fireCooldown = currentW.cooldown;
+        currentW.ammo -= 1;
+        if (currentW.ammo <= 0) {
+          currentW.reloading = true;
+          currentW.reloadRemaining = currentW.reloadTime;
+        }
+        doRangedFire(playerState.currentWeapon, currentW);
       }
     }
-    const dir = targetPoint.clone().sub(origin).normalize();
-
-    // Visual: different look per weapon
-    const myColor = myRobotData.visor.material.color.getHex();
-    if (playerState.currentWeapon === 1) {
-      spawnBeamVisual(origin, dir, myColor, 'mg');
-    } else {
-      spawnBeamVisual(origin, dir, 0xffaa00, 'beam');
+    else if (playerState.currentWeapon === 3) {
+      // === Beam cannon ===
+      if (currentW.ammo > 0) {
+        playerState.fireCooldown = currentW.cooldown;
+        currentW.ammo -= 1;
+        playerState.postFireDelay = currentW.cooldown;
+        // If stack was full, start charging timer now
+        if (currentW.ammo === currentW.maxAmmo - 1 || currentW.chargeRemaining <= 0) {
+          currentW.chargeRemaining = currentW.chargeTime;
+        }
+        doRangedFire(playerState.currentWeapon, currentW);
+      }
     }
-
-    // Report to server
-    ws.send(JSON.stringify({
-      type: 'shoot',
-      weapon: playerState.currentWeapon,
-      origin: { x: origin.x, y: origin.y, z: origin.z },
-      target: { x: targetPoint.x, y: targetPoint.y, z: targetPoint.z },
-      hitId: hitId
-    }));
   }
 
   playerState.hitFlash = Math.max(0, playerState.hitFlash - dt * 2);
+}
+
+// Ranged fire (gun/beam cannon) - extracted for reuse
+function doRangedFire(weaponId, currentW) {
+  const armOffset = new THREE.Vector3(0.7, 0, 0).applyAxisAngle(new THREE.Vector3(0,1,0), myGroup.rotation.y);
+  const origin = myGroup.position.clone().add(armOffset);
+  origin.y += 1.0;
+
+  const range = currentW.range;
+  let targetPoint;
+  let hitId = null;
+  const fireLock = getLockTarget();
+  if (fireLock) {
+    const lockPos = fireLock.group.position.clone();
+    lockPos.y += 1.0;
+    const distToLock = origin.distanceTo(lockPos);
+    if (distToLock <= range) {
+      targetPoint = lockPos;
+      hitId = fireLock.id;
+    } else {
+      targetPoint = lockPos;
+    }
+  } else {
+    targetPoint = aimPoint.clone();
+    const shotDir = targetPoint.clone().sub(origin).normalize();
+    let closestHit = null;
+    let closestDist = Infinity;
+    for (const rp of remotePlayers.values()) {
+      if (!rp.alive) continue;
+      const target = rp.group.position.clone();
+      target.y += 1.0;
+      const toTarget = target.clone().sub(origin);
+      const projLen = toTarget.dot(shotDir);
+      if (projLen < 0 || projLen > range) continue;
+      const projPoint = origin.clone().add(shotDir.clone().multiplyScalar(projLen));
+      const perpDist = projPoint.distanceTo(target);
+      const hitRadius = weaponId === 3 ? 1.2 : 1.5;
+      if (perpDist < hitRadius && projLen < closestDist) {
+        closestDist = projLen;
+        closestHit = rp;
+      }
+    }
+    if (closestHit) {
+      hitId = closestHit.id;
+      targetPoint = closestHit.group.position.clone();
+      targetPoint.y += 1.0;
+    }
+  }
+  const dir = targetPoint.clone().sub(origin).normalize();
+
+  const myColor = myRobotData.visor.material.color.getHex();
+  if (weaponId === 2) {
+    spawnBeamVisual(origin, dir, myColor, 'mg');
+  } else {
+    spawnBeamVisual(origin, dir, 0xffaa00, 'beam');
+  }
+
+  ws.send(JSON.stringify({
+    type: 'shoot',
+    weapon: weaponId,
+    origin: { x: origin.x, y: origin.y, z: origin.z },
+    target: { x: targetPoint.x, y: targetPoint.y, z: targetPoint.z },
+    hitId: hitId
+  }));
 }
 
 function updateRemotePlayers(dt) {
@@ -1091,13 +1321,22 @@ function updateRemotePlayers(dt) {
     let diff = rp.targetRotY - rp.group.rotation.y;
     while (diff > Math.PI) diff -= Math.PI * 2;
     while (diff < -Math.PI) diff += Math.PI * 2;
-    rp.group.rotation.y += diff * Math.min(dt * 10, 1);
+    if (!rp.knockedDown) {
+      rp.group.rotation.y += diff * Math.min(dt * 10, 1);
+    }
 
-    // Simple walk cycle based on movement
+    // Knockdown visual: tilt
+    if (rp.knockedDown) {
+      rp.group.rotation.z = Math.min(rp.group.rotation.z + dt * 3, Math.PI / 2.2);
+    } else {
+      rp.group.rotation.z += (0 - rp.group.rotation.z) * Math.min(dt * 8, 1);
+    }
+
+    // Walk cycle
     const dx = rp.targetX - rp.prevX;
     const dz = rp.targetZ - rp.prevZ;
     const moveMag = Math.sqrt(dx*dx + dz*dz);
-    if (moveMag > 0.01) {
+    if (moveMag > 0.01 && !rp.knockedDown) {
       rp.walkCycle += dt * 8;
       const swing = Math.sin(rp.walkCycle) * 0.4;
       rp.robotData.legs[0].rotation.x = swing;
