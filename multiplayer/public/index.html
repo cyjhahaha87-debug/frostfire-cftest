@@ -492,21 +492,14 @@ function updateMagnetLock() {
 // ===== Projectiles (visual only, hit is server-authoritative) =====
 const projectiles = [];
 function spawnBeamVisual(origin, direction, color, type = 'mg') {
-  // Different look per weapon
-  let radius, length, velocity, life;
   if (type === 'beam') {
-    radius = 0.25;
-    length = 4.0;
-    velocity = 140;
-    life = 1.2;
-  } else {
-    radius = 0.08;
-    length = 1.2;
-    velocity = 80;
-    life = 1.0;
+    // Hitscan beam: instant long pillar that fades out
+    spawnHitscanBeam(origin, direction, color);
+    return;
   }
+  // Machine gun: fast-moving projectile
   const beam = new THREE.Mesh(
-    new THREE.CylinderGeometry(radius, radius, length, 8),
+    new THREE.CylinderGeometry(0.08, 0.08, 1.2, 8),
     new THREE.MeshBasicMaterial({ color })
   );
   beam.position.copy(origin);
@@ -515,17 +508,71 @@ function spawnBeamVisual(origin, direction, color, type = 'mg') {
   beam.quaternion.copy(quat);
   scene.add(beam);
 
-  const light = new THREE.PointLight(color, type === 'beam' ? 4 : 2, type === 'beam' ? 15 : 8);
+  const light = new THREE.PointLight(color, 2, 8);
   light.position.copy(origin);
   scene.add(light);
-  setTimeout(() => scene.remove(light), type === 'beam' ? 150 : 80);
+  setTimeout(() => scene.remove(light), 80);
 
   projectiles.push({
     mesh: beam,
-    velocity: direction.clone().normalize().multiplyScalar(velocity),
-    life: life
+    velocity: direction.clone().normalize().multiplyScalar(80),
+    life: 1.0
   });
 }
+
+// Hitscan beam: instantly spawns a long pillar that fades over ~0.4s
+function spawnHitscanBeam(origin, direction, color) {
+  const dir = direction.clone().normalize();
+  const length = 100; // weapon range
+  const center = origin.clone().add(dir.clone().multiplyScalar(length / 2));
+
+  // Core beam (bright, thick)
+  const core = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.35, 0.35, length, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 1.0,
+      side: THREE.DoubleSide
+    })
+  );
+  core.position.copy(center);
+  const up = new THREE.Vector3(0, 1, 0);
+  const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
+  core.quaternion.copy(quat);
+  scene.add(core);
+
+  // Outer glow (softer, wider)
+  const glow = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.9, 0.9, length, 12, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0.6,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    })
+  );
+  glow.position.copy(center);
+  glow.quaternion.copy(quat);
+  scene.add(glow);
+
+  // Muzzle flash light
+  const flashLight = new THREE.PointLight(color, 8, 20);
+  flashLight.position.copy(origin);
+  scene.add(flashLight);
+
+  // Store for fade-out animation
+  beamEffects.push({
+    core, glow, flashLight,
+    life: 0.45,
+    maxLife: 0.45
+  });
+}
+
+// Beam effects (hitscan beams) - separate from projectiles because they don't travel
+const beamEffects = [];
 
 const effects = [];
 function createExplosion(position, color = 0xff8800) {
@@ -1074,6 +1121,32 @@ function updateProjectiles(dt) {
   }
 }
 
+function updateBeamEffects(dt) {
+  for (let i = beamEffects.length - 1; i >= 0; i--) {
+    const bf = beamEffects[i];
+    bf.life -= dt;
+    const ratio = bf.life / bf.maxLife;
+    // Core fades a bit faster than glow
+    bf.core.material.opacity = Math.max(0, ratio * ratio);
+    bf.glow.material.opacity = Math.max(0, ratio * 0.6);
+    // Beam "thickness" also shrinks slightly over time
+    const thickScale = 0.7 + ratio * 0.3;
+    bf.core.scale.x = thickScale;
+    bf.core.scale.z = thickScale;
+    bf.glow.scale.x = thickScale;
+    bf.glow.scale.z = thickScale;
+    // Light dims quickly
+    bf.flashLight.intensity = 8 * ratio * ratio;
+
+    if (bf.life <= 0) {
+      scene.remove(bf.core);
+      scene.remove(bf.glow);
+      scene.remove(bf.flashLight);
+      beamEffects.splice(i, 1);
+    }
+  }
+}
+
 function updateEffects(dt) {
   for (let i = effects.length - 1; i >= 0; i--) {
     const ef = effects[i];
@@ -1162,6 +1235,7 @@ function loop() {
     updatePlayer(dt);
     updateRemotePlayers(dt);
     updateProjectiles(dt);
+    updateBeamEffects(dt);
     updateEffects(dt);
     updateCamera();
     updateLockOnIndicator();
