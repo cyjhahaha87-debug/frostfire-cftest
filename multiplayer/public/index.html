@@ -40,6 +40,21 @@
   #boost-fill { background: linear-gradient(90deg, #08f, #4cf); }
   .overheat { background: linear-gradient(90deg, #f40, #f80) !important; }
 
+  .weapon-slot {
+    flex: 1; background: rgba(0,0,0,0.6); padding: 8px 10px; border-radius: 4px;
+    border: 1px solid rgba(120, 200, 255, 0.3); font-size: 11px;
+    transition: all 0.15s;
+  }
+  .weapon-slot.active {
+    border-color: #ffcc00; background: rgba(40, 30, 0, 0.7);
+    box-shadow: 0 0 8px rgba(255, 204, 0, 0.4);
+  }
+  .weapon-slot.reloading { opacity: 0.6; }
+  .w-header { font-weight: bold; margin-bottom: 3px; color: #9cf; }
+  .w-key { color: #fc6; margin-right: 4px; }
+  .w-ammo { font-size: 16px; font-family: 'Courier New', monospace; font-weight: bold; }
+  .w-status { font-size: 10px; color: #fc6; min-height: 12px; }
+
   #crosshair {
     position: fixed; top: 50%; left: 50%; width: 20px; height: 20px;
     margin: -10px 0 0 -10px; pointer-events: none;
@@ -92,6 +107,7 @@
   Space — 점프 / 공중 부스트<br>
   좌클릭 — 사격 / 우클릭 — 자석 락온<br>
   Tab — 락온 전환<br>
+  <b>1</b> — 기관총 / <b>2</b> — 빔포<br>
 </div>
 
 <div id="hud-right" class="hidden">
@@ -108,6 +124,18 @@
   <div class="bar-container">
     <div class="bar-label">BOOSTER <span id="boost-text">100%</span></div>
     <div class="bar-bg"><div id="boost-fill" class="bar-fill" style="width:100%"></div></div>
+  </div>
+  <div id="weapons-ui" style="display:flex; gap:6px; margin-top:4px;">
+    <div class="weapon-slot" id="weapon-1">
+      <div class="w-header"><span class="w-key">[1]</span> 기관총</div>
+      <div class="w-ammo" id="w1-ammo">30 / 30</div>
+      <div class="w-status" id="w1-status"></div>
+    </div>
+    <div class="weapon-slot" id="weapon-2">
+      <div class="w-header"><span class="w-key">[2]</span> 빔포</div>
+      <div class="w-ammo" id="w2-ammo">3 / 3</div>
+      <div class="w-status" id="w2-status"></div>
+    </div>
   </div>
 </div>
 
@@ -310,8 +338,71 @@ const playerState = {
   velocity: new THREE.Vector3(),
   fireCooldown: 0,
   hitFlash: 0,
-  alive: true
+  alive: true,
+  // Weapon system
+  currentWeapon: 1, // 1 = machine gun, 2 = beam cannon
+  weapons: {
+    1: { // Machine gun
+      ammo: 30, maxAmmo: 30,
+      reloading: false,
+      reloadTime: 10.0,
+      reloadRemaining: 0,
+      cooldown: 0.12, // between shots
+      range: 50,
+      damage: 8
+    },
+    2: { // Beam cannon
+      ammo: 3, maxAmmo: 3,
+      reloading: false, // fully reloaded (auto recharge per shot)
+      reloadTime: 20.0,
+      reloadRemaining: 0,
+      cooldown: 1.0, // post-fire recovery
+      range: 100,
+      damage: 40
+    }
+  },
+  postFireDelay: 0 // locks actions (beam cannon backswing)
 };
+
+// ===== Weapon system =====
+function switchWeapon(n) {
+  if (playerState.postFireDelay > 0) return; // can't switch during beam cannon recovery
+  if (playerState.currentWeapon === n) return;
+  playerState.currentWeapon = n;
+  playerState.fireCooldown = 0.15; // small cooldown after switch
+}
+
+function updateWeapons(dt) {
+  for (const key of [1, 2]) {
+    const w = playerState.weapons[key];
+    if (w.reloading) {
+      w.reloadRemaining -= dt;
+      if (w.reloadRemaining <= 0) {
+        w.ammo = w.maxAmmo;
+        w.reloading = false;
+      }
+    }
+    // Weapon 2 (beam cannon): auto-recharge 1 shot at a time
+    if (key === 2 && !w.reloading && w.ammo < w.maxAmmo) {
+      if (!w._recharging) {
+        w._recharging = true;
+        w.reloadRemaining = w.reloadTime;
+      }
+      w.reloadRemaining -= dt;
+      if (w.reloadRemaining <= 0) {
+        w.ammo = Math.min(w.ammo + 1, w.maxAmmo);
+        if (w.ammo < w.maxAmmo) {
+          w.reloadRemaining = w.reloadTime;
+        } else {
+          w._recharging = false;
+        }
+      }
+    }
+  }
+  if (playerState.postFireDelay > 0) {
+    playerState.postFireDelay -= dt;
+  }
+}
 
 // ===== Input =====
 const keys = {};
@@ -319,6 +410,8 @@ const mouse = { left: false, right: false };
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'Tab') { e.preventDefault(); cycleLockOn(); }
+  if (e.code === 'Digit1' || e.code === 'Numpad1') switchWeapon(1);
+  if (e.code === 'Digit2' || e.code === 'Numpad2') switchWeapon(2);
 });
 addEventListener('keyup', e => keys[e.code] = false);
 addEventListener('mousedown', e => {
@@ -398,9 +491,22 @@ function updateMagnetLock() {
 
 // ===== Projectiles (visual only, hit is server-authoritative) =====
 const projectiles = [];
-function spawnBeamVisual(origin, direction, color) {
+function spawnBeamVisual(origin, direction, color, type = 'mg') {
+  // Different look per weapon
+  let radius, length, velocity, life;
+  if (type === 'beam') {
+    radius = 0.25;
+    length = 4.0;
+    velocity = 140;
+    life = 1.2;
+  } else {
+    radius = 0.08;
+    length = 1.2;
+    velocity = 80;
+    life = 1.0;
+  }
   const beam = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.1, 0.1, 1.5, 8),
+    new THREE.CylinderGeometry(radius, radius, length, 8),
     new THREE.MeshBasicMaterial({ color })
   );
   beam.position.copy(origin);
@@ -409,15 +515,15 @@ function spawnBeamVisual(origin, direction, color) {
   beam.quaternion.copy(quat);
   scene.add(beam);
 
-  const light = new THREE.PointLight(color, 2, 8);
+  const light = new THREE.PointLight(color, type === 'beam' ? 4 : 2, type === 'beam' ? 15 : 8);
   light.position.copy(origin);
   scene.add(light);
-  setTimeout(() => scene.remove(light), 80);
+  setTimeout(() => scene.remove(light), type === 'beam' ? 150 : 80);
 
   projectiles.push({
     mesh: beam,
-    velocity: direction.clone().normalize().multiplyScalar(80),
-    life: 1.5
+    velocity: direction.clone().normalize().multiplyScalar(velocity),
+    life: life
   });
 }
 
@@ -480,6 +586,34 @@ function updateHUD() {
   boostText.textContent = Math.ceil(playerState.boost) + '%';
   boostFill.classList.toggle('overheat', playerState.overheat);
   damageFlash.style.opacity = playerState.hitFlash;
+
+  // Weapons
+  for (const n of [1, 2]) {
+    const w = playerState.weapons[n];
+    const slot = document.getElementById('weapon-' + n);
+    const ammoEl = document.getElementById('w' + n + '-ammo');
+    const statusEl = document.getElementById('w' + n + '-status');
+    slot.classList.toggle('active', playerState.currentWeapon === n);
+
+    ammoEl.textContent = `${w.ammo} / ${w.maxAmmo}`;
+
+    let status = '';
+    if (n === 1) {
+      slot.classList.toggle('reloading', w.reloading);
+      if (w.reloading) {
+        status = `재장전 ${w.reloadRemaining.toFixed(1)}s`;
+      }
+    } else {
+      slot.classList.toggle('reloading', w.ammo === 0);
+      if (w.ammo < w.maxAmmo && w._recharging) {
+        status = `충전 ${w.reloadRemaining.toFixed(1)}s`;
+      }
+      if (playerState.currentWeapon === 2 && playerState.postFireDelay > 0) {
+        status = `후딜 ${playerState.postFireDelay.toFixed(1)}s`;
+      }
+    }
+    statusEl.textContent = status;
+  }
 
   playerCountEl.textContent = remotePlayers.size + 1;
   let list = '';
@@ -625,13 +759,14 @@ function handleMessage(msg) {
     }
   }
   else if (msg.type === 'shoot_fx') {
-    if (msg.shooterId === myId) return; // we already rendered our own shot
+    if (msg.shooterId === myId) return;
     const origin = new THREE.Vector3(msg.origin.x, msg.origin.y, msg.origin.z);
     const target = new THREE.Vector3(msg.target.x, msg.target.y, msg.target.z);
     const dir = target.clone().sub(origin).normalize();
     const shooter = remotePlayers.get(msg.shooterId);
-    const color = shooter ? shooter.color.accent : 0xff8800;
-    spawnBeamVisual(origin, dir, color);
+    const type = msg.weapon === 2 ? 'beam' : 'mg';
+    const color = type === 'beam' ? 0xffaa00 : (shooter ? shooter.color.accent : 0xff8800);
+    spawnBeamVisual(origin, dir, color, type);
   }
   else if (msg.type === 'damage') {
     if (msg.targetId === myId) {
@@ -666,6 +801,15 @@ function handleMessage(msg) {
       playerState.boost = playerState.maxBoost;
       playerState.alive = true;
       playerState.velocity.set(0, 0, 0);
+      // Reset weapons
+      playerState.weapons[1].ammo = playerState.weapons[1].maxAmmo;
+      playerState.weapons[1].reloading = false;
+      playerState.weapons[1].reloadRemaining = 0;
+      playerState.weapons[2].ammo = playerState.weapons[2].maxAmmo;
+      playerState.weapons[2]._recharging = false;
+      playerState.weapons[2].reloadRemaining = 0;
+      playerState.postFireDelay = 0;
+      playerState.currentWeapon = 1;
     } else {
       const rp = remotePlayers.get(msg.id);
       if (rp) {
@@ -722,15 +866,21 @@ function updatePlayer(dt) {
   const moving = moveDir.lengthSq() > 0;
   if (moving) moveDir.normalize();
 
-  const boosting = (keys['ShiftLeft'] || keys['ShiftRight']) && !playerState.overheat && playerState.boost > 0 && moving;
+  const boosting = (keys['ShiftLeft'] || keys['ShiftRight']) && !playerState.overheat && playerState.boost > 0 && moving && playerState.postFireDelay <= 0;
   const speed = boosting ? 18 : 7;
 
-  playerState.velocity.x = moveDir.x * speed;
-  playerState.velocity.z = moveDir.z * speed;
+  // During post-fire delay (beam cannon recovery), freeze horizontal movement
+  if (playerState.postFireDelay > 0) {
+    playerState.velocity.x = 0;
+    playerState.velocity.z = 0;
+  } else {
+    playerState.velocity.x = moveDir.x * speed;
+    playerState.velocity.z = moveDir.z * speed;
+  }
 
   myRobotData.flame.visible = boosting;
 
-  if (keys['Space']) {
+  if (keys['Space'] && playerState.postFireDelay <= 0) {
     if (playerState.onGround) {
       playerState.velocity.y = 9;
       playerState.onGround = false;
@@ -789,22 +939,54 @@ function updatePlayer(dt) {
 
   // Firing
   playerState.fireCooldown -= dt;
-  if (mouse.left && playerState.fireCooldown <= 0 && playerState.alive) {
-    playerState.fireCooldown = 0.18;
+  const currentW = playerState.weapons[playerState.currentWeapon];
+  const canFire = mouse.left
+    && playerState.fireCooldown <= 0
+    && playerState.postFireDelay <= 0
+    && playerState.alive
+    && currentW.ammo > 0
+    && !(playerState.currentWeapon === 1 && currentW.reloading);
+
+  if (canFire) {
+    playerState.fireCooldown = currentW.cooldown;
+    currentW.ammo -= 1;
+
+    // Machine gun triggers reload when empty
+    if (playerState.currentWeapon === 1 && currentW.ammo <= 0) {
+      currentW.reloading = true;
+      currentW.reloadRemaining = currentW.reloadTime;
+    }
+    // Beam cannon: apply post-fire delay, reset recharge timer
+    if (playerState.currentWeapon === 2) {
+      playerState.postFireDelay = currentW.cooldown; // 1s lock
+      if (!currentW._recharging) {
+        currentW._recharging = true;
+        currentW.reloadRemaining = currentW.reloadTime;
+      }
+    }
+
     const armOffset = new THREE.Vector3(0.7, 0, 0).applyAxisAngle(new THREE.Vector3(0,1,0), myGroup.rotation.y);
     const origin = myGroup.position.clone().add(armOffset);
     origin.y += 1.0;
 
+    const range = currentW.range;
     let targetPoint;
     let hitId = null;
     const fireLock = getLockTarget();
     if (fireLock) {
-      targetPoint = fireLock.group.position.clone();
-      targetPoint.y += 1.0;
-      hitId = fireLock.id;
+      const lockPos = fireLock.group.position.clone();
+      lockPos.y += 1.0;
+      const distToLock = origin.distanceTo(lockPos);
+      if (distToLock <= range) {
+        targetPoint = lockPos;
+        hitId = fireLock.id;
+      } else {
+        // Out of range: shoot toward lock but don't claim hit
+        targetPoint = lockPos;
+      }
     } else {
       targetPoint = aimPoint.clone();
-      // Client-side hitscan: find which remote player is along the beam path
+      // Client-side hitscan along beam within weapon range
       const shotDir = targetPoint.clone().sub(origin).normalize();
       let closestHit = null;
       let closestDist = Infinity;
@@ -812,34 +994,38 @@ function updatePlayer(dt) {
         if (!rp.alive) continue;
         const target = rp.group.position.clone();
         target.y += 1.0;
-        // Vector from origin to target
         const toTarget = target.clone().sub(origin);
         const projLen = toTarget.dot(shotDir);
-        if (projLen < 0 || projLen > 80) continue; // behind or too far
-        // Perpendicular distance from beam line to target
+        if (projLen < 0 || projLen > range) continue;
         const projPoint = origin.clone().add(shotDir.clone().multiplyScalar(projLen));
         const perpDist = projPoint.distanceTo(target);
-        if (perpDist < 1.5 && projLen < closestDist) {
+        // Beam cannon has tighter hit radius (more skill-based)
+        const hitRadius = playerState.currentWeapon === 2 ? 1.2 : 1.5;
+        if (perpDist < hitRadius && projLen < closestDist) {
           closestDist = projLen;
           closestHit = rp;
         }
       }
       if (closestHit) {
         hitId = closestHit.id;
-        // Adjust target point to actual hit for server validation
         targetPoint = closestHit.group.position.clone();
         targetPoint.y += 1.0;
       }
     }
     const dir = targetPoint.clone().sub(origin).normalize();
 
-    // Visual
+    // Visual: different look per weapon
     const myColor = myRobotData.visor.material.color.getHex();
-    spawnBeamVisual(origin, dir, myColor);
+    if (playerState.currentWeapon === 1) {
+      spawnBeamVisual(origin, dir, myColor, 'mg');
+    } else {
+      spawnBeamVisual(origin, dir, 0xffaa00, 'beam');
+    }
 
     // Report to server
     ws.send(JSON.stringify({
       type: 'shoot',
+      weapon: playerState.currentWeapon,
       origin: { x: origin.x, y: origin.y, z: origin.z },
       target: { x: targetPoint.x, y: targetPoint.y, z: targetPoint.z },
       hitId: hitId
@@ -972,6 +1158,7 @@ function loop() {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (myGroup) {
     updateMagnetLock();
+    updateWeapons(dt);
     updatePlayer(dt);
     updateRemotePlayers(dt);
     updateProjectiles(dt);
