@@ -137,26 +137,35 @@ wss.on('connection', (ws) => {
       }
     }
     else if (msg.type === 'shoot') {
-      // Client reports a shot. Server validates hit.
       if (!player.alive) return;
+      const weapon = msg.weapon === 2 ? 2 : 1;
+      const damage = weapon === 2 ? 40 : 8;
+      const hitRange = weapon === 2 ? 100 : 50;
+
       broadcast({
         type: 'shoot_fx',
         shooterId: player.id,
+        weapon: weapon,
         origin: msg.origin,
         target: msg.target,
         hit: msg.hitId || null
       });
-      // Simple hit resolution: if shooter claims a hit, verify distance
       if (msg.hitId && players.has(msg.hitId)) {
         const victim = players.get(msg.hitId);
         if (!victim.alive) return;
+        // Check range: shooter to victim
+        const sdx = victim.x - player.x;
+        const sdy = victim.y - player.y;
+        const sdz = victim.z - player.z;
+        const shotDist = Math.sqrt(sdx*sdx + sdy*sdy + sdz*sdz);
+        if (shotDist > hitRange + 5) return; // out of range
+
         const dx = victim.x - msg.target.x;
         const dy = victim.y + 1 - msg.target.y;
         const dz = victim.z - msg.target.z;
         const distSq = dx*dx + dy*dy + dz*dz;
-        // Accept hit if claimed target is within 3 units of actual position
         if (distSq < 9) {
-          victim.hp -= SHOT_DAMAGE;
+          victim.hp -= damage;
           broadcast({
             type: 'damage',
             targetId: victim.id,
