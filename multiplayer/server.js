@@ -8,9 +8,67 @@ const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const TICK_RATE = 20; // 20Hz snapshot broadcast
-const MAX_HP = 100;
+const MAX_HP = 250;
 const RESPAWN_DELAY = 2000;
 const SHOT_DAMAGE = 12;
+
+// Shared obstacle list (must match client's addBox calls)
+const OBSTACLES = [
+  { x: 15, z: 10, w: 5, h: 4, d: 5 },
+  { x: -12, z: 15, w: 6, h: 6, d: 6 },
+  { x: 0, z: -20, w: 10, h: 3, d: 10 },
+  { x: 25, z: -15, w: 4, h: 8, d: 4 },
+  { x: -25, z: -8, w: 7, h: 5, d: 4 },
+  { x: -30, z: 25, w: 8, h: 4, d: 8 },
+  { x: 30, z: 30, w: 5, h: 6, d: 5 }
+];
+
+// Returns true if a segment from (ax,ay,az) to (bx,by,bz) hits any obstacle (2D check in XZ, with Y range)
+function segmentBlocked(ax, ay, az, bx, by, bz) {
+  // Slab method for AABB-ray intersection, but for segment
+  for (const ob of OBSTACLES) {
+    const minX = ob.x - ob.w/2, maxX = ob.x + ob.w/2;
+    const minZ = ob.z - ob.d/2, maxZ = ob.z + ob.d/2;
+    const minY = 0, maxY = ob.h;
+
+    const dx = bx - ax, dy = by - ay, dz = bz - az;
+    let tMin = 0, tMax = 1;
+
+    // X slab
+    if (Math.abs(dx) < 1e-6) {
+      if (ax < minX || ax > maxX) continue;
+    } else {
+      const t1 = (minX - ax) / dx;
+      const t2 = (maxX - ax) / dx;
+      tMin = Math.max(tMin, Math.min(t1, t2));
+      tMax = Math.min(tMax, Math.max(t1, t2));
+      if (tMin > tMax) continue;
+    }
+    // Y slab
+    if (Math.abs(dy) < 1e-6) {
+      if (ay < minY || ay > maxY) continue;
+    } else {
+      const t1 = (minY - ay) / dy;
+      const t2 = (maxY - ay) / dy;
+      tMin = Math.max(tMin, Math.min(t1, t2));
+      tMax = Math.min(tMax, Math.max(t1, t2));
+      if (tMin > tMax) continue;
+    }
+    // Z slab
+    if (Math.abs(dz) < 1e-6) {
+      if (az < minZ || az > maxZ) continue;
+    } else {
+      const t1 = (minZ - az) / dz;
+      const t2 = (maxZ - az) / dz;
+      tMin = Math.max(tMin, Math.min(t1, t2));
+      tMax = Math.min(tMax, Math.max(t1, t2));
+      if (tMin > tMax) continue;
+    }
+    // If segment overlaps the box (t in [0,1]) -> blocked
+    if (tMax >= 0 && tMin <= 1) return true;
+  }
+  return false;
+}
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -157,7 +215,12 @@ wss.on('connection', (ws) => {
       const dist = Math.sqrt(dx*dx + dz*dz);
       if (dist > 8) return; // too far to be a valid melee
 
-      const MELEE_DAMAGE = 15;
+      // Wall check: can't melee through obstacles
+      if (segmentBlocked(player.x, player.y + 1, player.z, victim.x, victim.y + 1, victim.z)) {
+        return;
+      }
+
+      const MELEE_DAMAGE = 25;
       victim.hp -= MELEE_DAMAGE;
 
       // Stagger
@@ -203,9 +266,9 @@ wss.on('connection', (ws) => {
     }
     else if (msg.type === 'shoot') {
       if (!player.alive) return;
-      const weapon = msg.weapon === 2 ? 2 : 1;
-      const damage = weapon === 2 ? 40 : 8;
-      const hitRange = weapon === 2 ? 100 : 50;
+      const weapon = msg.weapon === 3 ? 3 : 2; // 2 = MG, 3 = beam cannon
+      const damage = weapon === 3 ? 50 : 5;
+      const hitRange = weapon === 3 ? 100 : 50;
 
       broadcast({
         type: 'shoot_fx',
@@ -224,6 +287,11 @@ wss.on('connection', (ws) => {
         const sdz = victim.z - player.z;
         const shotDist = Math.sqrt(sdx*sdx + sdy*sdy + sdz*sdz);
         if (shotDist > hitRange + 5) return; // out of range
+
+        // Line of sight check
+        if (segmentBlocked(player.x, player.y + 1, player.z, victim.x, victim.y + 1, victim.z)) {
+          return; // obstacle blocks the shot
+        }
 
         const dx = victim.x - msg.target.x;
         const dy = victim.y + 1 - msg.target.y;
