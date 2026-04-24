@@ -943,19 +943,6 @@ function handleMessage(msg) {
       if (rp) { rp.alive = false; rp.group.visible = false; }
     }
   }
-    const victim = msg.victimId === myId ? { name: getMyName() } : remotePlayers.get(msg.victimId);
-    const killer = msg.killerId === myId ? { name: getMyName() } : remotePlayers.get(msg.killerId);
-    if (victim && killer) {
-      addKillMsg(`${killer.name} ▶ ${victim.name}`);
-    }
-    if (msg.victimId === myId) {
-      playerState.alive = false;
-      playerState.hp = 0;
-    } else {
-      const rp = remotePlayers.get(msg.victimId);
-      if (rp) { rp.alive = false; rp.group.visible = false; }
-    }
-  }
   else if (msg.type === 'respawn') {
     if (msg.id === myId) {
       myGroup.position.set(msg.x, msg.y, msg.z);
