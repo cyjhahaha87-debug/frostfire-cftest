@@ -356,7 +356,7 @@ let myRobotData = null;
 let myGroup = null;
 
 const playerState = {
-  hp: 100, maxHp: 100,
+  hp: 250, maxHp: 250,
   boost: 100, maxBoost: 100,
   overheat: false,
   walkCycle: 0,
@@ -369,11 +369,14 @@ const playerState = {
   currentWeapon: 2, // Default to machine gun (most used)
   weapons: {
     1: { // Beam saber (melee)
-      cooldown: 0.6, // between swings
-      range: 6,      // must be within this to use
-      damage: 15,
+      cooldown: 0.6,
+      detectRange: 10,  // auto-detect target in front within this
+      detectAngle: 0.5, // dot product threshold (~60 deg cone)
+      chaseRange: 15,   // if target exits this during dash, whiff
+      damage: 25,
       dashSpeed: 28,
-      dashTime: 0.25
+      dashTime: 0.35,   // slightly longer since chase may need it
+      swingTime: 0.4    // whiff animation duration
     },
     2: { // Machine gun
       ammo: 30, maxAmmo: 30,
@@ -382,7 +385,7 @@ const playerState = {
       reloadRemaining: 0,
       cooldown: 0.12,
       range: 50,
-      damage: 8
+      damage: 5
     },
     3: { // Beam cannon - stack based
       ammo: 3, maxAmmo: 3,
@@ -391,7 +394,7 @@ const playerState = {
       chargeRemaining: 0, // time until next +1
       cooldown: 1.0,      // post-fire delay
       range: 100,
-      damage: 40
+      damage: 50
     }
   },
   postFireDelay: 0,
@@ -400,8 +403,10 @@ const playerState = {
   dashTime: 0,
   dashDir: new THREE.Vector3(),
   dashTarget: null,
-  hasHit: false, // track if current dash already hit
-  swingTime: 0, // for visual arm swing
+  hasHit: false,
+  swinging: false,      // whiff (no dash) swing in progress
+  swingDuration: 0,
+  swingTime: 0,
   // Stagger (when hit by melee)
   stagger: 0,       // time remaining in hit stun
   meleeHitCount: 0, // accumulates, reset after 5s without hit
@@ -572,7 +577,16 @@ function spawnBeamVisual(origin, direction, color, type = 'mg') {
 // Hitscan beam: instantly spawns a long pillar that fades over ~0.4s
 function spawnHitscanBeam(origin, direction, color) {
   const dir = direction.clone().normalize();
-  const length = 100; // weapon range
+  // Truncate at first wall hit or max range
+  let length = 100;
+  const endPoint = origin.clone().add(dir.clone().multiplyScalar(length));
+  const sb = segmentBlocked(origin.x, origin.y, origin.z, endPoint.x, endPoint.y, endPoint.z);
+  if (sb.blocked) {
+    length *= sb.t * 0.98;
+    // Wall impact effect
+    const hitPoint = origin.clone().add(dir.clone().multiplyScalar(length));
+    createExplosion(hitPoint, 0xffaa00);
+  }
   const center = origin.clone().add(dir.clone().multiplyScalar(length / 2));
 
   // Core beam (bright, thick)
@@ -664,6 +678,60 @@ function checkObstacleCollision(pos, radius = 0.7) {
   }
 }
 
+// Segment blocked by obstacles? (AABB slab test)
+// Returns { blocked: bool, t: 0..1 fraction along segment where first hit occurs, or 1 }
+function segmentBlocked(ax, ay, az, bx, by, bz) {
+  let earliestT = 1;
+  let any = false;
+  for (const ob of obstacles) {
+    const m = ob.mesh;
+    const minX = m.position.x - ob.w/2, maxX = m.position.x + ob.w/2;
+    const minZ = m.position.z - ob.d/2, maxZ = m.position.z + ob.d/2;
+    const minY = 0, maxY = ob.h;
+
+    const dx = bx - ax, dy = by - ay, dz = bz - az;
+    let tMin = 0, tMax = 1;
+
+    if (Math.abs(dx) < 1e-6) {
+      if (ax < minX || ax > maxX) continue;
+    } else {
+      const t1 = (minX - ax) / dx;
+      const t2 = (maxX - ax) / dx;
+      tMin = Math.max(tMin, Math.min(t1, t2));
+      tMax = Math.min(tMax, Math.max(t1, t2));
+      if (tMin > tMax) continue;
+    }
+    if (Math.abs(dy) < 1e-6) {
+      if (ay < minY || ay > maxY) continue;
+    } else {
+      const t1 = (minY - ay) / dy;
+      const t2 = (maxY - ay) / dy;
+      tMin = Math.max(tMin, Math.min(t1, t2));
+      tMax = Math.min(tMax, Math.max(t1, t2));
+      if (tMin > tMax) continue;
+    }
+    if (Math.abs(dz) < 1e-6) {
+      if (az < minZ || az > maxZ) continue;
+    } else {
+      const t1 = (minZ - az) / dz;
+      const t2 = (maxZ - az) / dz;
+      tMin = Math.max(tMin, Math.min(t1, t2));
+      tMax = Math.min(tMax, Math.max(t1, t2));
+      if (tMin > tMax) continue;
+    }
+    if (tMax >= 0 && tMin <= 1) {
+      any = true;
+      if (tMin > 0 && tMin < earliestT) earliestT = tMin;
+    }
+  }
+  return { blocked: any, t: earliestT };
+}
+
+// Check if there's a clear line of sight from origin to target
+function hasLineOfSight(origin, target) {
+  return !segmentBlocked(origin.x, origin.y, origin.z, target.x, target.y, target.z).blocked;
+}
+
 // ===== HUD =====
 const hpFill = document.getElementById('hp-fill');
 const hpText = document.getElementById('hp-text');
@@ -693,19 +761,26 @@ function updateHUD() {
 
     let status = '';
     if (n === 1) {
-      // Saber: show range status
       ammoEl.textContent = '∞';
       slot.classList.remove('reloading');
       if (playerState.currentWeapon === 1) {
-        const lk = getLockTarget();
-        if (!lk) status = '락온 필요';
-        else {
-          const dx = lk.group.position.x - myGroup.position.x;
-          const dz = lk.group.position.z - myGroup.position.z;
+        // Check auto-detect: find any target in front cone
+        const saberW = w;
+        const facingX = -Math.sin(yaw);
+        const facingZ = -Math.cos(yaw);
+        let found = null;
+        for (const rp of remotePlayers.values()) {
+          if (!rp.alive) continue;
+          const dx = rp.group.position.x - myGroup.position.x;
+          const dz = rp.group.position.z - myGroup.position.z;
           const dist = Math.sqrt(dx*dx + dz*dz);
-          if (dist > w.range) status = `거리 초과 (${dist.toFixed(1)})`;
-          else status = `대쉬 가능 (${dist.toFixed(1)})`;
+          if (dist > saberW.detectRange) continue;
+          const dot = (dx/(dist||1)) * facingX + (dz/(dist||1)) * facingZ;
+          if (dot < saberW.detectAngle) continue;
+          if (!found || dist < found.dist) found = { rp, dist };
         }
+        if (found) status = `⚔ 추적 (${found.dist.toFixed(1)})`;
+        else status = '허공 베기';
       }
     } else if (n === 2) {
       ammoEl.textContent = `${w.ammo} / ${w.maxAmmo}`;
@@ -964,6 +1039,7 @@ function handleMessage(msg) {
       playerState.meleeHitCount = 0;
       playerState.invul = 0;
       playerState.dashing = false;
+      playerState.swinging = false;
     } else {
       const rp = remotePlayers.get(msg.id);
       if (rp) {
@@ -1022,8 +1098,8 @@ function updatePlayer(dt) {
 
   // Movement is locked during stagger, knockdown, or post-fire delay
   const movementLocked = playerState.stagger > 0 || playerState.knockedDown || playerState.postFireDelay > 0;
-  const boosting = (keys['ShiftLeft'] || keys['ShiftRight']) && !playerState.overheat && playerState.boost > 0 && moving && !movementLocked && !playerState.dashing;
-  const baseSpeed = playerState.stagger > 0 ? 2 : 7; // slowed while staggered
+  const boosting = (keys['ShiftLeft'] || keys['ShiftRight']) && !playerState.overheat && playerState.boost > 0 && moving && !movementLocked && !playerState.dashing && !playerState.swinging;
+  const baseSpeed = playerState.stagger > 0 ? 2 : (playerState.swinging ? 4 : 7);
   const speed = boosting ? 18 : baseSpeed;
 
   if (playerState.dashing) {
@@ -1038,7 +1114,7 @@ function updatePlayer(dt) {
 
   myRobotData.flame.visible = boosting;
 
-  if (keys['Space'] && !movementLocked && !playerState.dashing) {
+  if (keys['Space'] && !movementLocked && !playerState.dashing && !playerState.swinging) {
     if (playerState.onGround) {
       playerState.velocity.y = 9;
       playerState.onGround = false;
@@ -1071,6 +1147,9 @@ function updatePlayer(dt) {
   let targetYaw;
   if (playerState.dashing && playerState.dashTarget) {
     targetYaw = Math.atan2(playerState.dashDir.x, playerState.dashDir.z) + Math.PI;
+  } else if (playerState.swinging) {
+    // Whiff swing: face camera direction
+    targetYaw = yaw + Math.PI;
   } else if (lock) {
     const dx = lock.group.position.x - myGroup.position.x;
     const dz = lock.group.position.z - myGroup.position.z;
@@ -1133,8 +1212,30 @@ function updatePlayer(dt) {
   // === Dash (melee attack movement) ===
   if (playerState.dashing) {
     playerState.dashTime -= dt;
-    playerState.velocity.x = playerState.dashDir.x * playerState.weapons[1].dashSpeed;
-    playerState.velocity.z = playerState.dashDir.z * playerState.weapons[1].dashSpeed;
+    const saberW = playerState.weapons[1];
+
+    // Re-aim dash each frame if target still valid and in chase range
+    if (playerState.dashTarget && playerState.dashTarget.alive) {
+      const dx = playerState.dashTarget.group.position.x - myGroup.position.x;
+      const dz = playerState.dashTarget.group.position.z - myGroup.position.z;
+      const dist = Math.sqrt(dx*dx + dz*dz);
+      if (dist > saberW.chaseRange) {
+        playerState.dashTarget = null;
+      } else {
+        // Check LOS: if target went behind a wall, lose chase
+        const origin = myGroup.position.clone(); origin.y += 1.0;
+        const tpos = playerState.dashTarget.group.position.clone(); tpos.y += 1.0;
+        if (!hasLineOfSight(origin, tpos)) {
+          playerState.dashTarget = null;
+        } else {
+          const len = dist || 1;
+          playerState.dashDir.set(dx/len, 0, dz/len);
+        }
+      }
+    }
+
+    playerState.velocity.x = playerState.dashDir.x * saberW.dashSpeed;
+    playerState.velocity.z = playerState.dashDir.z * saberW.dashSpeed;
 
     // Check hit during dash
     if (!playerState.hasHit && playerState.dashTarget && playerState.dashTarget.alive) {
@@ -1143,13 +1244,13 @@ function updatePlayer(dt) {
       const dist = Math.sqrt(dx*dx + dz*dz);
       if (dist < 2.0) {
         playerState.hasHit = true;
-        // Send melee hit to server
         ws.send(JSON.stringify({
           type: 'melee',
           hitId: playerState.dashTarget.id
         }));
-        // Local saber hit effect
         createExplosion(playerState.dashTarget.group.position.clone().setY(1.2), 0xffffff);
+        // End dash early on successful hit
+        playerState.dashTime = Math.min(playerState.dashTime, 0.1);
       }
     }
 
@@ -1157,16 +1258,29 @@ function updatePlayer(dt) {
       playerState.dashing = false;
       myRobotData.saberGroup.visible = false;
       playerState.swingTime = 0;
+      playerState.velocity.x = 0;
+      playerState.velocity.z = 0;
     }
   }
 
-  // Saber swing visual (quick arc)
-  if (playerState.dashing) {
+  // Whiff swing (no dash, just animation in place)
+  if (playerState.swinging) {
+    playerState.swingDuration -= dt;
+    if (playerState.swingDuration <= 0) {
+      playerState.swinging = false;
+      myRobotData.saberGroup.visible = false;
+    }
+  }
+
+  // Saber swing visual (during dash or whiff)
+  if (playerState.dashing || playerState.swinging) {
     playerState.swingTime += dt;
     myRobotData.saberGroup.visible = true;
-    // Swing arm forward and saber from up to forward
-    const t = Math.min(playerState.swingTime / playerState.weapons[1].dashTime, 1);
-    const swingAngle = -Math.PI/2 + t * Math.PI; // -90deg -> +90deg
+    const duration = playerState.dashing ? playerState.weapons[1].dashTime : playerState.weapons[1].swingTime;
+    const t = Math.min(playerState.swingTime / duration, 1);
+    // Horizontal slash: arm goes from pulled-back (-90 X axis, i.e. raised) to forward swing
+    // Use Z rotation for horizontal swing arc
+    const swingAngle = -Math.PI/2 + t * Math.PI;
     myRobotData.arms[1].rotation.x = swingAngle;
     myRobotData.saberGroup.rotation.x = swingAngle * 0.7;
   } else {
@@ -1180,30 +1294,81 @@ function updatePlayer(dt) {
   // Input: can we even try to fire?
   const actionLocked = playerState.postFireDelay > 0
     || playerState.dashing
+    || playerState.swinging
     || playerState.stagger > 0
     || playerState.knockedDown;
 
   if (mouse.left && playerState.fireCooldown <= 0 && playerState.alive && !actionLocked) {
     if (playerState.currentWeapon === 1) {
-      // === Beam saber: only works if locked target in range ===
+      // === Beam saber ===
+      // Always swings. If target in front within detectRange, dash-chase.
+      // If no target, swing in place (whiff).
+      playerState.fireCooldown = currentW.cooldown;
+      playerState.hasHit = false;
+      playerState.swingTime = 0;
+
+      // Find auto-target: locked enemy if in range, else nearest in front cone
+      let target = null;
       const lock = getLockTarget();
       if (lock) {
         const dx = lock.group.position.x - myGroup.position.x;
         const dz = lock.group.position.z - myGroup.position.z;
         const dist = Math.sqrt(dx*dx + dz*dz);
-        if (dist <= currentW.range) {
-          // Initiate dash
-          playerState.dashing = true;
-          playerState.dashTime = currentW.dashTime;
-          playerState.hasHit = false;
-          playerState.dashTarget = lock;
-          const len = dist || 1;
-          playerState.dashDir.set(dx/len, 0, dz/len);
-          playerState.fireCooldown = currentW.cooldown;
-          playerState.swingTime = 0;
+        if (dist <= currentW.detectRange) {
+          target = lock;
         }
       }
-      // No lock or out of range: nothing happens (could play "whiff" later)
+      if (!target) {
+        // Auto-detect nearest in front cone
+        const facingX = -Math.sin(yaw);
+        const facingZ = -Math.cos(yaw);
+        let best = null, bestDist = Infinity;
+        for (const rp of remotePlayers.values()) {
+          if (!rp.alive) continue;
+          const dx = rp.group.position.x - myGroup.position.x;
+          const dz = rp.group.position.z - myGroup.position.z;
+          const dist = Math.sqrt(dx*dx + dz*dz);
+          if (dist > currentW.detectRange) continue;
+          const nx = dx / (dist || 1);
+          const nz = dz / (dist || 1);
+          const dot = nx * facingX + nz * facingZ;
+          if (dot < currentW.detectAngle) continue;
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = rp;
+          }
+        }
+        target = best;
+      }
+
+      if (target) {
+        // Check line of sight before dashing
+        const targetPos = target.group.position.clone();
+        targetPos.y += 1.0;
+        const origin = myGroup.position.clone();
+        origin.y += 1.0;
+        if (!hasLineOfSight(origin, targetPos)) {
+          // Wall between us and target: whiff instead
+          target = null;
+        }
+      }
+
+      if (target) {
+        // Chase dash toward target
+        playerState.dashing = true;
+        playerState.dashTime = currentW.dashTime;
+        playerState.dashTarget = target;
+        const dx = target.group.position.x - myGroup.position.x;
+        const dz = target.group.position.z - myGroup.position.z;
+        const len = Math.sqrt(dx*dx + dz*dz) || 1;
+        playerState.dashDir.set(dx/len, 0, dz/len);
+      } else {
+        // Whiff: swing in place, no dash
+        playerState.dashing = false;
+        playerState.swinging = true;
+        playerState.swingDuration = currentW.swingTime;
+        playerState.dashTarget = null;
+      }
     }
     else if (playerState.currentWeapon === 2) {
       // === Machine gun ===
@@ -1249,7 +1414,7 @@ function doRangedFire(weaponId, currentW) {
     const lockPos = fireLock.group.position.clone();
     lockPos.y += 1.0;
     const distToLock = origin.distanceTo(lockPos);
-    if (distToLock <= range) {
+    if (distToLock <= range && hasLineOfSight(origin, lockPos)) {
       targetPoint = lockPos;
       hitId = fireLock.id;
     } else {
@@ -1276,11 +1441,29 @@ function doRangedFire(weaponId, currentW) {
       }
     }
     if (closestHit) {
-      hitId = closestHit.id;
-      targetPoint = closestHit.group.position.clone();
-      targetPoint.y += 1.0;
+      // Check line of sight
+      const targetPos = closestHit.group.position.clone();
+      targetPos.y += 1.0;
+      if (hasLineOfSight(origin, targetPos)) {
+        hitId = closestHit.id;
+        targetPoint = targetPos;
+      }
+      // If blocked, targetPoint stays at aimPoint (wall/ground hit)
     }
   }
+
+  // Truncate beam at wall if path is blocked
+  const sb = segmentBlocked(origin.x, origin.y, origin.z, targetPoint.x, targetPoint.y, targetPoint.z);
+  if (sb.blocked) {
+    const dirVec = targetPoint.clone().sub(origin);
+    // Stop just before the wall
+    targetPoint = origin.clone().add(dirVec.multiplyScalar(sb.t * 0.98));
+    // If we were claiming a hit but path is blocked, cancel the hit
+    hitId = null;
+    // Wall impact effect
+    createExplosion(targetPoint.clone(), weaponId === 3 ? 0xffaa00 : 0xffff88);
+  }
+
   const dir = targetPoint.clone().sub(origin).normalize();
 
   const myColor = myRobotData.visor.material.color.getHex();
@@ -1431,7 +1614,15 @@ function updateLockOnIndicator() {
       lockonIndicator.style.display = 'block';
       lockonIndicator.style.left = x + 'px';
       lockonIndicator.style.top = y + 'px';
-      lockonIndicator.style.borderColor = magnetLockedId ? '#ffcc00' : '#ff3030';
+      // Check LOS
+      const origin = myGroup.position.clone(); origin.y += 1.0;
+      const tpos = target.group.position.clone(); tpos.y += 1.0;
+      const blocked = !hasLineOfSight(origin, tpos);
+      if (blocked) {
+        lockonIndicator.style.borderColor = '#888';
+      } else {
+        lockonIndicator.style.borderColor = magnetLockedId ? '#ffcc00' : '#ff3030';
+      }
     } else lockonIndicator.style.display = 'none';
   } else lockonIndicator.style.display = 'none';
 }
